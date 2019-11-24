@@ -3,32 +3,16 @@
 from __future__ import print_function
 import os, re, sys, time, signal
 import argparse
+import invoke
 from cmc import Cmc
 
 # Power up the chassis and any blades present
 # Get chassis temps, blade temps, ping each blade
 # Discover blade IP addresses, write ansible hosts file
 
-# Steps:
-# 0. Get chassis status info.
-# 1. Connect to SSH port.
-# 2. Read ssh lines, looking for login prompt, use regex: 'root@clr-' anything ' login:'.
-# 3. Login as root
-# 4. Wait for password prompt
-# 5. Give password
-# 6. Read ssh lines, look for shell prompt, use regex.
-####
-# 7. Give "ip -4 address show eno1" command
-# 8. Parse out the IP address.
-# 9. Do again for eno2.
-# a. Log out of the root session to the blade
-# b. Close SSH session.
-# c. Make steps 1-9 a thread.
-# d. Run one thread per server blade to get all IP addresses.
 
-
-PASSWORD = "VRTX_CMC_PASSWORD" # env variable containing password
-BLADE_ROOTPW = "orangeGirl"
+VRTX_PW      = "VRTX_CMC_PW" # env variable containing password
+BLADE_ROOTPW = "VRTX_SERVER_ROOTPW" # env variable containing password
 
 
 def handler(signum, frame):
@@ -36,14 +20,14 @@ def handler(signum, frame):
     if signum == 2:
         sys.exit()
 
-def puts( s ):
+def puts(s):
     sys.stdout.write(s)
     sys.stdout.flush()
 
 
 def testTrue(stat, idx, result, good, bad):
     stat[idx] = result
-    return good if result else bad
+    return good if result else bad[UNDEFINED]
 
 def fahr(celcius):
     c = int(celcius)
@@ -58,9 +42,10 @@ def health(cmc):
     status = [True] * 5 # fans, temps, pwrs, cables, intrus
     fans, temps, pwrs, cables, intrus = {}, {}, {}, {}, {}
 
-    name = cmc.send("getchassisname").split()[1].strip()
+    lines = cmc.send_rac("getchassisname").splitlines()
+    name = lines[1] if "getchassisname" in lines[0] else lines[0]
 
-    lines = cmc.send("getsensorinfo").splitlines()
+    lines = cmc.send_rac("getsensorinfo").splitlines()
     for line in lines:
         if len(line) < 3: continue
         linearr = line.strip().split()
@@ -71,7 +56,11 @@ def health(cmc):
         if "Cable"     in linearr[0] : cables[linearr[2]] = linearr[3]
         if "Intrusion" in linearr[0] : intrus[linearr[3]] = linearr[4]
 
-    print("Cluster '{}'. Ambient Temp = {}F/{}C.".format(name, *fahr(temps['Ambient'][1])))
+    lines = cmc.send_rac("getpminfo").splitlines()
+    line = lines[2] if "System Input Power" in lines[2] else lines[3]
+    watts = line.split('=')[1].strip().split()[0]
+
+    print("Cluster '{}'. Power draw: {} Watts. Ambient Temp = {}F/{}C.".format(name, watts, *fahr(temps['Ambient'][1])))
     print(testTrue(status, 0, all(map(lambda s: s    == 'OK',  list(fans.values()))),  "Fans OK. ", "Fans Not OK. ") , end='')
     print(testTrue(status, 1, all(map(lambda s: s[0] == 'OK',  list(temps.values()))), "Temps OK. ", "Temps Not OK. ") , end='')
     print(testTrue(status, 2, all(map(lambda s: s    == 'OK',  list(pwrs.values()))),  "Power OK. ", "Power Not OK. ") , end='')
@@ -90,9 +79,8 @@ def watchLine(cmc, startCmd, signals, stops, show):
     # signals: list of keywords
     gotStop = False
     start = time.time()
-    cmd = startCmd
     while True:
-        lines = cmc.send(cmd).splitlines()
+        lines = cmc.send_rac(startCmd).splitlines()
         for line in lines:
             line = line.strip()
             if len(line) < 3: continue
@@ -101,12 +89,15 @@ def watchLine(cmc, startCmd, signals, stops, show):
             if show == 1 and gotSig: printWts(start, line)
             gotStop = any([ True if x in line else False for x in stops ])
             if gotStop: break
-        cmd = ""
         if gotStop: break
         if show == 1: printWts(start, line)
 
 
 def waitBlade(cmc, blade, show):
+    if not blade in ['1','2','3','4', 'all']:
+        print("Specify 1,2,3,4 or all for blade.")
+        return
+
     # show: 0- Nothing. 1- HiLites. 2-showAll
     '''
     Initializing firmware interfaces...
@@ -121,98 +112,176 @@ def waitBlade(cmc, blade, show):
     lookForThese = [ "Connect", "Initializ", "Lifecycle", "[  " ]
     stops = [ "clr-", "login" ]
 
-    startCmd = "connect -m Server-{}".format(blade)
-    watchLine(cmc, startCmd, lookForThese, stops, show)
+    if ( blade == 'all' ):
+        for blade in "1234":
+            startCmd = "connect -m Server-{}".format(blade)
+            watchLine(cmc, startCmd, lookForThese, stops, show)
+            print("All servers booted.".format(blade))
+    else:
+        startCmd = "connect -m Server-{}".format(blade)
+        watchLine(cmc, startCmd, lookForThese, stops, show)
+        print("Server-{} has booted.".format(blade))
 
-
-def unescape_ansi(line):
-    # Remove ANSI escape sequences
-    unescape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
-    return unescape.sub('', line)
 
 def logout(cmc, blade):
-    cmc.send("connect -m Server-{}".format(blade))
-    time.sleep(2.5)
-    lines = cmc.send_raw("\r")
-    lines = unescape_ansi(lines).strip()
-    if not lines.lower().endswith(" #"):
-        print("Not logged in.")
+    if blade in ['1','2','3','4']:
+        logout1(cmc, blade)
         return
-    cmc.send_raw("exit\r")
+    elif (blade == 'all'):
+        for i in "1234":
+            logout1(cmc, i)
+            return
+    else:
+        print("Specify 1,2,3,4 or all for blade.")
+        return
+
+def logout1(cmc, blade):
+    cmc.send_rac("connect -m Server-{}".format(blade))
+    time.sleep(2)
+    lines = cmc.send("\r").strip()
+    if not lines.lower().endswith(" #"):
+        print("Blade {} not logged in.".format(blade))
+        return
+    cmc.send("exit\r")
 
 
 def login(cmc, blade, rootpw):
-    cmc.send("connect -m Server-{}".format(blade))
+    if blade in ['1','2','3','4']:
+        login1(cmc, blade, rootpw)
+        return
+    elif (blade == 'all'):
+        for i in "1234":
+            login1(cmc, i, rootpw)
+            return
+    else:
+        print("Specify 1,2,3,4 or all for blade.")
+        return
+
+def login1(cmc, blade, rootpw):
+    cmc.send_rac("connect -m Server-{}".format(blade))
     time.sleep(2.5)
-    lines = cmc.send_raw("\r")
-    lines = unescape_ansi(lines).strip()
-    print(lines)
+    lines = cmc.send("\r").strip()
     if lines.lower().endswith(" #"):
-        print("Already logged in.")
+        print("Blade {} already logged in.".format(blade))
         return
 
     while True:
         if 'login' in lines.lower():
             break
-        lines = cmc.send_raw("\r")
-        lines = unescape_ansi(lines).strip()
-        print(lines)
-    lines = cmc.send_raw("root\r")
+        lines = cmc.send("\r").strip()
+    lines = cmc.send("root\r")
     while True:
-        lines = unescape_ansi(lines).strip()
+        lines = lines.strip()
         if 'password' in lines.lower():
             break
-        lines = cmc.send_raw("\r").strip()
+        lines = cmc.send("\r").strip()
+    lines = cmc.send("{}\r".format(rootpw)).strip()
     time.sleep(1)
-    lines = cmc.send_raw("{}\r".format(rootpw))
-    lines = unescape_ansi(lines).strip()
-    time.sleep(1)
-    lines = cmc.send_raw("\r")
-    lines = unescape_ansi(lines).strip()
-    print(lines)
-    lines = cmc.send_raw("/usr/sbin/sh -c 'echo PermitRootLogin yes >/etc/ssh/sshd_config.abc'\r")
-    lines = unescape_ansi(lines).strip()
-    print(lines)
+    lines = cmc.send("\r").strip()
+    print("Blade {} logged in.".format(blade))
     return
 
 
 def sshd_config(cmc, blade):
-    lines = cmc.send_raw("/usr/sbin/sh -c 'echo PermitRootLogin yes >/etc/ssh/sshd_config.abc'\r")
-    lines = unescape_ansi(lines).strip()
-    print(lines)
-    return
+    if blade in ['1','2','3','4']:
+        sshd_config1(cmc, blade)
+        return
+    elif (blade == 'all'):
+        for i in "1234":
+            sshd_config1(cmc, i)
+            return
+    else:
+        print("Specify 1,2,3,4 or all for blade.")
+        return
+
+def sshd_config1(cmc, blade):
+    err = False
+    cmc.send_rac("connect -m Server-{}".format(blade))
+    time.sleep(1.5)
+    cmc.send("\r")
+    lines = cmc.send("/bin/ex /etc/ssh/sshd_config\r")
+    #if not "New File" in lines:  # confirm
+    #    err = True    # even if error occurs, keep trying
+    cmc.send("a\r")
+    cmc.send("PermitRootLogin yes\r")
+    cmc.send(".\r")
+    lines = cmc.send("wq\r")
+    if not "written" in lines:   # confirm prompt
+        err = True    # even if error occurs, keep trying
+    if not err: print("Blade {} now permits root ssh login.".format(blade))
+    return err
+    # NOW- send private key over
+    # ssh-copy-id root@10.0.0.94
+
+    responder = Responder(
+        pattern=r"Are you ready? \[Y/n\] ",
+        response="y\n",
+    )
+    c.run("excitable-program", watchers=[responder])
+
+"""
+    $ /usr/bin/ssh-copy-id root@10.0.0.94
+    blahblah
+    blahblah
+    Password:
+    blank line
+    Number of key(s) added: 2
+    blank line
+    blahblah
+    blahblah
+"""
 
 
 """
-root@clr-589ff1b2a75d45cc81648cf979e63c24 ~ # ip -4 address show eno1
+# ip -4 address show eno1
 2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
     inet 10.0.0.81/16 brd 10.0.255.255 scope global dynamic noprefixroute eno1
-       valid_lft 603270sec preferred_lft 603270sec
-root@clr-589ff1b2a75d45cc81648cf979e63c24 ~ # 
 """
-serverIndices = [0,1,2,3]
 def getIPs(cmc, blade):
-    ips = []
-    lines = cmc.send_raw("ip -4 address show eno1\r")
-    lines = unescape_ansi(lines).strip()
-    ip = lines.splitlines()[1].split()[1].split('/')[0]
-    ips.append(ip)
-    lines = cmc.send_raw("ip -4 address show eno2\r")
-    lines = unescape_ansi(lines).strip()
-    ip = lines.splitlines()[1].split()[1].split('/')[0]
-    ips.append(ip)
-    return ips
+    if blade in ['1','2','3','4']:
+        return getIPs1(cmc, blade)
+    elif (blade == 'all'):
+        ips = []
+        for i in "1234":
+            ips.append(getIPs1(cmc, i))
+            return ips
+    else:
+        print("Specify 1,2,3,4 or all for blade.")
+        return
+
+def getIPs1(cmc, blade):
+    # Each blade has 2 NICs that are externally accessible, eno1 and eno2, but we only need one.
+    cmc.send_rac("connect -m Server-{}".format(blade))
+    time.sleep(2.0)
+    cmc.send("\r")
+    #ips = []
+    lines = cmc.send("ip -4 address show eno1\r").strip()
+    print(lines)
+    ip = lines.splitlines()[2].split()[1].split('/')[0]
+    return ip
+    #ips.append(ip)
+    #lines = cmc.send("ip -4 address show eno2\r").strip()
+    #ip = lines.splitlines()[2].split()[1].split('/')[0]
+    #ips.append(ip)
+    #return ips
 
 
 def chassisUp(cmc):
     # Power up just chassis.
-    lines = cmc.send("chassisaction -m chassis powerup").splitlines()
+    lines = cmc.send_rac("chassisaction -m chassis powerup").splitlines()
     print("Chassis booting...  ", end='')
     sys.stdout.flush()
     infra = [False] * 4
+
+    # A chassis powerup takes over 5 mins, don't sit in tight loop beating on status.
+    i = 0
     while True:
-        time.sleep(2)
-        lines = cmc.send("getmodinfo").splitlines()
+        if i > 8:
+            time.sleep(2)
+        else:
+            time.sleep(30)
+        i += 1
+        lines = cmc.send_rac("getmodinfo").splitlines()
         for line in lines:
             linearr = line.split()
             if chassisTest("Chassis", linearr): infra[0] = True
@@ -221,7 +290,6 @@ def chassisUp(cmc):
             if chassisTest("Switch-1", linearr): infra[3] = True
         if all(infra): break
     print("Chassis booted.")
-    sys.stdout.flush()
 
 
 def chassisTest(mod, linearr):
@@ -230,21 +298,51 @@ def chassisTest(mod, linearr):
 
 def serversDown(cmc):
     # powerdown each blade
-    cmc.send("serveraction -a powerdown").splitlines()
+    mods = whatsUpV(cmc)   #  [1,2,3,4,Chassis]
+    cmc.send_rac("serveraction -a powerdown").splitlines()
     print("All server blades powering down.")
-    cmc.send("chassisaction -m chassis powerdown").splitlines()
+    cmc.send_rac("chassisaction -m chassis powerdown").splitlines()
     print("Chassis powering down.")
 
 
 def serversUp(cmc, what):
-    if 'chassis' in what.lower():
-        chassisUp(cmc)  # Power up just the chassis.
+    mods = whatsUpV(cmc)   #  [1,2,3,4,Chassis]
+    print(mods)
+    if what == 'chassis':
+        if mods[4]:
+            print("Chassis already powered up.")
+        else:
+            chassisUp(cmc)  # Power up just the chassis.
         return
 
-    chassisUp(cmc)  # Power up just the chassis.
+    if what in ['1','2','3','4']:
+        if mods[int(what)-1]:
+            print("Server-{} already powered up.".format(what))
+            return
+        if (not mods[4]):
+            chassisUp(cmc)
+        serversUp1(cmc, what)
+        print("Server-{} powering up.".format(what))
+        return
+
+    if (what == 'all'):
+        if all(mods):
+            print("All servers already powered up.")
+            return
+        serversUp1(cmc, what)
+        return
+
+    print("Specify 1,2,3,4 or all for blade.")
+    return
+
+def serversUp1(cmc, what):
+    if not 'all' in what:
+        cmc.send_rac("serveraction -m Server-{} powerup".format(what))
+        return
+
     # Power up any servers which are Present and Off. A server can be ON, OFF, N/A.
     servers = ['N/A'] * 4
-    lines = cmc.send("getmodinfo").splitlines()
+    lines = cmc.send_rac("getmodinfo").splitlines()
     for line in lines:
         if len(line) < 3: continue
         linearr = line.split()
@@ -256,9 +354,22 @@ def serversUp(cmc, what):
     print("Servers Present: {}. Turning on {} servers...  ".format(4-servers.count('Present'), servers.count('OFF')), end="")
     sys.stdout.flush()
 
-    lines = cmc.send("serveraction -a powerup").splitlines()
+    lines = cmc.send_rac("serveraction -a powerup").splitlines()
     print("All server blades booting.")
-    sys.stdout.flush()
+
+
+def whatsUpV(cmc):
+    # Return a vector showing power on|off for these 5 modules
+    mods = [False] * 5 #  [1,2,3,4,Chassis]
+    lines = cmc.send_rac("getmodinfo").splitlines()
+    for line in lines:
+        linearr = line.split()
+        if "Server-1" in linearr[0] and "ON" in linearr[2]: mods[0] = True
+        if "Server-2" in linearr[0] and "ON" in linearr[2]: mods[1] = True
+        if "Server-3" in linearr[0] and "ON" in linearr[2]: mods[2] = True
+        if "Server-4" in linearr[0] and "ON" in linearr[2]: mods[3] = True
+        if "Chassis"  in linearr[0] and "ON" in linearr[2]: mods[4] = True
+    return mods
 
 
 def whatsUp(cmc):
@@ -274,7 +385,7 @@ def whatsUp(cmc):
     infra = [False] * 4
     servers = ['N/A'] * 4 # A server can be ON, OFF, N/A.
 
-    lines = cmc.send("getmodinfo").splitlines()
+    lines = cmc.send_rac("getmodinfo").splitlines()
     for line in lines:
         if len(line) < 3: continue
         linearr = line.split()
@@ -288,7 +399,7 @@ def whatsUp(cmc):
         if "Server-4" in linearr[0] : servers[3] = linearr[2]
     print("Chassis ", end='')
     if all(infra):
-        print("is up.")
+        print("is up. ", end='')
     else:
         print("is not up.")
         sys.stdout.flush()
@@ -317,22 +428,25 @@ def main():
     parser.add_argument('--whatsUp', help='Report which devices are powered on.', action='store_true')
     parser.add_argument('--powerUp', help='Turn on chassis and all blades, or one at a time.')
     parser.add_argument('--powerDown', help='Turn off all blades, then chassis.', action='store_true')
-    parser.add_argument('--waitBlade', help='Wait for all blades to boot.', action='store_true')
-    parser.add_argument('--logIn', help='logIn.', action='store_true')
-    parser.add_argument('--logOut', help='logOut.', action='store_true')
+    parser.add_argument('--waitBlade', help='Wait for all blades to boot: 1,2,3,4,all.')
+    parser.add_argument('--logIn', help='logIn: 1,2,3,4,all.')
+    parser.add_argument('--logOut', help='logOut: 1,2,3,4,all.')
     parser.add_argument('--health', help='Check temps of chassis and blades, ping each blade.', action='store_true')
-    parser.add_argument('--IP', help='Get IP address of each blade.', action='store_true')
+    parser.add_argument('--ip', help='Get IP address of a blade: 1,2,3,4,all.')
+    parser.add_argument('--sshd', help='Configure Linux blade server for SSH root login: 1,2,3,4,all.')
     args = parser.parse_args()
 
     start_time = time.time()
 
-    cmc = Cmc(args.cmc, args.user, os.environ["VRTX_CMC_PASSWORD"])
+    cmc = Cmc(args.cmc, args.user, os.environ[VRTX_PW])
 
     if args.whatsUp:
         whatsUp(cmc)
 
     if args.powerUp is not None:
-        serversUp(cmc, args.powerUp)
+        what = args.powerUp.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        serversUp(cmc, what)
 
     if args.powerDown:
         serversDown(cmc)
@@ -340,19 +454,32 @@ def main():
     if args.health:
         health(cmc)
 
-    if args.waitBlade:
-        #waitBlade(cmc, 1, 2)
-        login(cmc, 2)
+    if args.waitBlade is not None:
+        what = args.waitBlade.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        waitBlade(cmc, what, 2)
 
-    if args.logIn:
-        login(cmc, 2, BLADE_ROOTPW)
+    if args.logIn is not None:
+        pw = os.environ[BLADE_ROOTPW]
+        what = args.logIn.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        login(cmc, what, pw)
 
-    if args.logOut:
-        logout(cmc, 2)
+    if args.logOut is not None:
+        what = args.logOut.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        logout(cmc, what)
 
-    if args.IP:
-        ips = getIPs(cmc, 2)
+    if args.ip is not None:
+        what = args.ip.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        ips = getIPs(cmc, what)
         print(ips)
+
+    if args.sshd is not None:
+        what = args.sshd.lower().strip()
+        if what[-1].isdigit(): what = what[-1]
+        sshd_config(cmc, what)
 
 
     elapsed_time = time.time() - start_time
