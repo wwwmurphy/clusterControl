@@ -10,8 +10,6 @@ import argparse
 paramiko.util.log_to_file("paramiko.log")
 logging.getLogger("paramiko").setLevel(logging.WARNING)
 
-hosts = [ '10.0.0.94' ]
-
 # sudo swupd bundle-add blahblah
 packages = "apache-flink big-data-basic binutils cassandra ceph clr-devops containers-basic \
 containers-basic-dev containers-virt containers-virt-dev database-extras dev-utils dev-utils-dev \
@@ -55,8 +53,10 @@ def main():
     signal.signal(signal.SIGQUIT, handler)
 
     parser = argparse.ArgumentParser(description='Add bundles to newly installed Clr-linux servers.')
-    parser.add_argument('-v', '--verbose', help='See all nodes.', action='store_true')
+    parser.add_argument('-s', '--servers', help='Install to these servers: a.b.c.d,a.b.c.d,...', required=True)
+    parser.add_argument('-u', '--update', help='Update only these servers: a.b.c.d,a.b.c.d,...', action='store_true')
     #parser.add_argument('--user', help='Specify User Name.', required=True)
+    #parser.add_argument('-v', '--verbose', help='See all nodes.', action='store_true')
     args = parser.parse_args()
 
     start_time = time.time()
@@ -64,22 +64,25 @@ def main():
     serverrootpw = os.environ['VRTX_SERVER_ROOTPW']
     user = 'root'
     auth_key = {"key_filename": "/home/wmurphy/.ssh/id_rsa"}
-    #config = Config(overrides={'sudo': {'password': serverrootpw}})
 
+    if args.update:  # Do update only
+        packages = ""
 
+    hosts = args.servers.split(',')
     for host in hosts:
         print("Performing OS Update and Package install for host {}".format(host))
         c = Connection(host, user=user, connect_kwargs= auth_key)
-        print()
-        result = c.run('df -h /', hide=True)
-        print("Starting Root filesystem capacity:\n{}".format(result.stdout.strip().splitlines()[1]))
-        print()
+        result = disk_free(c)
+        print("Starting Root filesystem capacity: {}".format(result))
 
-        result = c.run('swupd update --no-progress', hide=False)
-        print("ReturnCode: {}".format(result.return_code))
+        result = c.run('swupd update --no-progress --quiet', hide=False)
+        msg = "Success" if result.return_code == 0 else "Fail"
+        print("  OS Update result: {}".format(msg))
 
+        pkg_success, pkg_fail = 0,0
         for package in packages.split():
-            print("Installing package {}".format(package))
+            print("  Installing package {} ... ".format(package), end='')
+            msg = ""
             try:
                 result = c.run('swupd bundle-add --no-progress {}'.format(package), hide=True)
                 for line in result.stdout.splitlines():
@@ -92,19 +95,26 @@ def main():
                     if "Successfully installed" in line: continue
                     if "Finishing packs" in line: continue
                     if "No extra files" in line: continue
-                    print(line)
-                print("    ReturnCode: {}".format(result.return_code))
+                    if "Downloading packs" in line: continue
+                    print(' ' + line.strip(), end='')
+                msg = "Success" if result.return_code == 0 else "Fail"
+                if result.return_code == 0:
+                    pkg_success += 1
+                    msg = "Success"
+                else:
+                    pkg_fail += 1
+                    msg = "Fail"
             except:
-                continue
+                pkg_fail += 1
+                msg = "Fail"
+            print("  Result: {}".format(msg))
 
-        print()
-        result = c.run('df -h /', hide=True)
-        print(result.stdout.strip())
-        print("Installed {} packages.".format(len(packages.split())))
-        print()
-
+        result = disk_free(c)
+        print("Ending Root filesystem capacity: {}".format(result))
+        print("Of {} packages, {} installed, {} failed to install.".
+                format(len(packages.split()), pkg_success, pkg_fail))
         c.close()
-
+        print()
 
     elapsed_time = time.time() - start_time
     m, s = divmod(elapsed_time, 60)

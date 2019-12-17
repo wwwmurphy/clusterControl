@@ -34,10 +34,11 @@ class Cmc():
         return unescape_ansi(lines)
 
 
-    def send(self, cmd):
+    def send(self, cmd, wait=True):
         self.chan.send(cmd)
         output = ''
-        time.sleep(1.0)
+        if wait:
+            time.sleep(2.5)
         while True:
             if self.chan.recv_ready():
                 output = self.chan.recv(8192)
