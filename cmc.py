@@ -3,9 +3,12 @@ import re
 import time
 
 
+# Remove ANSI escape sequences
+#unescape = re.compile(r'(?:\x1B\r[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+unescape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]')
+
+
 def unescape_ansi(line):
-    # Remove ANSI escape sequences
-    unescape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
     return unescape.sub('', line)
 
 
@@ -22,10 +25,9 @@ class Cmc():
         self.chan.get_pty()
         self.chan.invoke_shell()
 
-        # Discard the logon banner
         while not self.chan.recv_ready():
             time.sleep(0.5)
-        self.chan.recv(1024)
+        #self.chan.recv(1024)
         return
 
 

@@ -21,18 +21,18 @@ BLADE_ROOTPW = "VRTX_SERVER_ROOTPW" # env variable containing password
 # Globals
 Modules = [False] * 5  # Vector showing power on|off  [Chassis,1,2,3,4]
 specData = {
-    "ChassisName": "",    # Lower case name
-    "Ready": "",          # True | False
-    "ACWatts": "",        # Integer string
-    "AmbientTemp": "",    # RealNum String
-    "Fans": "",           # OK | Not OK
-    "Temps": "",          # OK | Not OK
-    "PowerSupplies": "",  # OK | Not OK
-    "Cables": "",         # OK | Not OK
-    "Intrusion": "",      # True | False
-    "IP": "10.0.0.100",   # Chassis IP address
-    "BladesPresent": "",  # "1234"
-    "BladesOn": "",       # "1234"
+    "ChassisName": "",   # Lower case name
+    "Ready": "",         # True | False
+    "ACWatts": "",       # Integer string
+    "AmbientTemp": "",   # RealNum String
+    "Fans": "",          # OK | Not OK
+    "Temps": "",         # OK | Not OK
+    "PowerSupplies": "", # OK | Not OK
+    "Cables": "",        # OK | Not OK
+    "Intrusion": "",     # True | False
+    "IP": "",            # Chassis IP address
+    "BladesPresent": "", # "1234"
+    "BladesOn": "",      # "1234"
     "BladeIPs": [ ["",""],["",""],["",""],["",""] ]
 }
 
@@ -40,7 +40,8 @@ specData = {
 # Helper Functions
 
 # Remove ANSI escape sequences
-unescape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+#unescape = re.compile(r'(?:\x1B\r[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+unescape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]')
 
 def handler(signum, frame):
     print("Signal received: {}".format(str(signum)))
@@ -63,7 +64,7 @@ def unescape_ansi(line):
 
 
 def writeSpecFile(cmc, data):
-    chassisName = getChassisName(cmc).lower()
+    chassisName = getChassisName(cmc)
     with open("{}.json".format(chassisName), "w") as wfile:
         json.dump(data, wfile)
 
@@ -71,8 +72,10 @@ def writeSpecFile(cmc, data):
 # Command Line functions
 
 def getChassisName(cmc):
+    global specData
     lines = cmc.send_rac("getchassisname").splitlines()
-    name = lines[1] if "getchassisname" in lines[0] else lines[0]
+    lines = [ l for l in lines if len(l) > 0 ]
+    name = lines[2] if "getchassisname" in lines[1] else lines[1]
     name = name.lower()
     specData['ChassisName'] = name
     return name
@@ -114,19 +117,56 @@ def health(cmc):
         if "Intrusion" in linearr[0] : intrus[linearr[3]] = linearr[4]
 
     lines = cmc.send_rac("getpminfo").splitlines()
-    #print("GetPMinfo: {}".format(lines))
     line = lines[2] if "System Input Power" in lines[2] else lines[3]
     watts = line.split('=')[1].strip().split()[0]
 
-    whatsup = whatsUp(cmc)
+    whatsup,_,_ = whatsUp(cmc)
 
-    print("Cluster '{}'. Power draw: {} Watts. Ambient Temp = {}F/{}C.".format(name, watts, *fahr(temps['Ambient'][1])))
-    print(testTrue(status, 0, all(map(lambda s: s    == 'OK',  list(fans.values()))),  "Fans OK. ", "Fans Not OK. ") , end='')
-    print(testTrue(status, 1, all(map(lambda s: s[0] == 'OK',  list(temps.values()))), "Temps OK. ", "Temps Not OK. ") , end='')
-    print(testTrue(status, 2, all(map(lambda s: s    == 'OK',  list(pwrs.values()))),  "Power OK. ", "Power Not OK. ") , end='')
-    print(testTrue(status, 3, all(map(lambda s: s    == 'OK',  list(cables.values()))),"Cables OK. ", "Cables Not OK. ") , end='')
-    print(testTrue(status, 4, all(map(lambda s: s == 'Closed', list(intrus.values()))),"No Intrusion.", "Intrusion detected.")) 
-    print(whatsup)
+    # Cluster 'vrtx12'. Power draw: 407 Watts. Ambient Temp = 73.4F/23C.
+    # Fans OK. Temps OK. Power OK. Cables OK. No Intrusion.
+    # Chassis is up. Servers Present in slots: 1,2,3. Servers On in slots: 1
+    health  = "Cluster '{}'. Power draw: {} Watts. Ambient Temp = {}F/{}C.\n".format(name, watts, *fahr(temps['Ambient'][1]))
+    health += testTrue(status, 0, all(map(lambda s: s    == 'OK',  list(fans.values()))),  "Fans OK. ", "Fans Not OK. ")
+    health += testTrue(status, 1, all(map(lambda s: s[0] == 'OK',  list(temps.values()))), "Temps OK. ", "Temps Not OK. ")
+    health += testTrue(status, 2, all(map(lambda s: s    == 'OK',  list(pwrs.values()))),  "Power OK. ", "Power Not OK. ")
+    health += testTrue(status, 3, all(map(lambda s: s    == 'OK',  list(cables.values()))),"Cables OK. ", "Cables Not OK. ")
+    health += testTrue(status, 4, all(map(lambda s: s == 'Closed', list(intrus.values()))),"No Intrusion.", "Intrusion detected.") 
+    health += '\n'
+    health += whatsup
+    return health
+
+
+def inventory(cmc, rootpw):
+    global specData
+
+    h = health(cmc).splitlines()
+    name    = h[0].split()[1].strip("'.")
+    watts   = h[0].split()[4]
+    ambient = h[0].split()[9].rstrip(".")
+    fans    = h[1].split()[1].rstrip(".")
+    temps   = h[1].split()[3].rstrip(".")
+    power   = h[1].split()[5].rstrip(".")
+    cables  = h[1].split()[7].rstrip(".")
+    intrus  = False if h[1].split()[8] == 'No' else True
+    chassis = True if h[2].split()[2] == 'up.' else False
+    present = h[2].split()[7].rstrip(".")
+    servon  = h[2].split()[12].rstrip(".")
+
+    specData['ChassisName']   = name  # Lower case name
+    specData['Ready']         = chassis    # True | False
+    specData['ACWatts']       = watts    # Integer string
+    specData['AmbientTemp']   = ambient    # RealNum String
+    specData['Fans']          = fans    # OK | Not OK
+    specData['Temps']         = temps    # OK | Not OK
+    specData['PowerSupplies'] = power    # OK | Not OK
+    specData['Cables']        = cables    # OK | Not OK
+    specData['Intrusion']     = intrus    # True | False
+    specData['BladesPresent'] = present # "1234"
+    specData['BladesOn']      = servon  # "1234"
+
+    getIPs(cmc, servon.strip(","), rootpw)
+
+    writeSpecFile(cmc, specData)
 
 
 def watchLine(cmc, startCmd, signals, stops, show):
@@ -136,21 +176,25 @@ def watchLine(cmc, startCmd, signals, stops, show):
     start = time.time()
     gotStop = False
     lastLine = ""
+    wf = open("log.txt", "w")
     while True:
-        lines = cmc.send_rac(startCmd).splitlines()
+        alines = cmc.send_rac(startCmd)  # TODO remove debugging changes
+        lines = alines.splitlines()
+        wf.write(alines)
         for line in lines:
-            line = unescape_ansi(line).strip()
-            if len(line) < 3: continue
-            if line == lastLine:
-                continue
+            #line = unescape_ansi(line).strip()
+            line = line.strip()
+            if line == lastLine: continue
+            if len(line) < 4: continue
             lastLine = line
             if show == 2: printWts(start, line)
-            gotSig = any([ True if x in line else False for x in signals ])
+            gotSig = any([ True if x.lower() in line.lower() else False for x in signals ])
             if show == 1 and gotSig: printWts(start, line)
             gotStop = any([ True if x in line else False for x in stops ])
             if gotStop: break
         if gotStop: break
         if show == 1: printWts(start, line)
+    wf.close()
 
 
 def waitBlade(cmc, blade, show):
@@ -195,16 +239,13 @@ def logout(cmc, blade):
         if i == '0':
             continue
         lines = cmc.send("\r").strip().lower()
-        lines = unescape_ansi(lines)
-        # TODO test if not connected- get back {name}, then connect first.
         if lines.endswith("# "):
             lines = cmc.send("exit\r")
-            return
         if name in lines.lower():
             cmc.send_rac("connect -m Server-{}".format(i))
             time.sleep(2.5)
-            lines = cmc.send("exit\r")
-            return
+            cmc.send("exit\r")  # logged out
+        cmc.send("\x1c")    # disconnect
         print("Blade {} not logged in.".format(i))
 
 
@@ -228,13 +269,13 @@ def login(cmc, blade, rootpw):
                 lines = cmc.send("{}\r".format(rootpw), wait=False).strip()
                 time.sleep(1)
                 print("Blade {} logged in.".format(i))
-            lines = unescape_ansi(lines)
             if ' #' in lines:
                 break
     return
 
 
 def ping(cmc, blade, rootpw):
+    global specData
     getIPs(cmc, blade, rootpw)
     # This does not do an actual ping using icmp. It just wants to know if the OS is up yet,
     # so connecting to any socket will do that.
@@ -291,6 +332,7 @@ def ssh_keySetup(cmc, blade, rootpw):
     Number of key(s) added: 2
     blank line, blahblah - twice
     """
+    global specData
     for i in blade:
         if i == '0':
             continue
@@ -301,19 +343,17 @@ def ssh_keySetup(cmc, blade, rootpw):
         p.communicate()[0]
 
 
-"""
-# ip -4 address show eno1
-2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 10.0.0.81/16 brd 10.0.255.255 scope global dynamic noprefixroute eno1
-"""
 def getIPs(cmc, blade, rootpw):
+    # ip -4 address show eno1
+    #    2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    #       inet 10.0.0.81/16 brd 10.0.255.255 scope global dynamic noprefixroute eno1
     global Modules, specData
     Modules = whatsUpV(cmc)   #  [chassis,1,2,3,4]
     for i in blade:
         if i == '0':
             continue
-        if Modules[i]:
-            login(cmc, blade, rootpw)
+        if Modules[int(i)]:
+            login(cmc, i, rootpw)
             # Each blade has 2 NICs that are externally accessible, eno1 and eno2.
             lines = cmc.send("ip -4 address show eno1\r").strip()
             if len(lines) > 3:
@@ -321,17 +361,14 @@ def getIPs(cmc, blade, rootpw):
             lines = cmc.send("ip -4 address show eno2\r").strip()
             if len(lines) > 3:
                 specData['BladeIPs'][int(i)-1][1] = lines.splitlines()[2].split()[1].split('/')[0]
+            logout(cmc, i)
 
-    writeSpecFile(cmc, specData)
-
-    # Assemble more easily readable string.
-    if len(blade) == 2:
-        i = int(blade[1])-1
-        return "{},{}".format(specData['BladeIPs'][i][0],specData['BladeIPs'][i][1])
-    else:
-        return "{},{}; {},{}; {},{}; {},{}".format( \
-            specData['BladeIPs'][0][0],specData['BladeIPs'][0][1],specData['BladeIPs'][1][0],specData['BladeIPs'][1][1], \
-            specData['BladeIPs'][2][0],specData['BladeIPs'][2][1],specData['BladeIPs'][3][0],specData['BladeIPs'][3][1])
+    ips = ""
+    for m in range(1,5):
+        if str(m) in blade:
+            ips += "{},{}".format(specData['BladeIPs'][m-1][0],specData['BladeIPs'][m-1][1])
+        ips += "; "
+    return ips[:-2]
 
 
 def chassisUp(cmc):
@@ -400,15 +437,18 @@ def serversUp(cmc, blade):
 
 def whatsUpV(cmc):
     # Return a vector showing power on|off for these 5 modules
-    global Modules
+    global Modules, specData
     lines = cmc.send_rac("getmodinfo").splitlines()
     for line in lines:
+        if len(line) == 0: continue
         linearr = line.split()
         if "Chassis"  in linearr[0] and "ON" in linearr[2]: Modules[0] = True
         if "Server-1" in linearr[0] and "ON" in linearr[2]: Modules[1] = True
         if "Server-2" in linearr[0] and "ON" in linearr[2]: Modules[2] = True
         if "Server-3" in linearr[0] and "ON" in linearr[2]: Modules[3] = True
         if "Server-4" in linearr[0] and "ON" in linearr[2]: Modules[4] = True
+    m = Modules[1:] if Modules[0] == '0' else Modules
+    specData['BladesOn'] = m
     return Modules
 
 
@@ -442,7 +482,7 @@ def whatsUp(cmc):
         report += "is up. "
     else:
         report += "is not up. "
-        return report
+        return report, "", ""
 
     present = [ str(i+1) if not 'Present' in servers[i] else '' for i in range(4) ]
     servon  = [ str(i+1) if 'ON'          in servers[i] else '' for i in range(4) ]
@@ -451,79 +491,84 @@ def whatsUp(cmc):
     present = present if len(present) != 0 else 'None'
     servon = servon if len(servon) != 0 else 'None'
     report += "Servers Present in slots: {}. Servers On in slots: {}".format(present, servon)
-    return report
+    return report, present, servon
 
 
 def argForm(arg):
     which = arg.lower().strip()
     if which == 'all':
         return '01234'
-    if which is 'chassis':
+    if which == 'chassis':
         return '0'
-    # TODO this code needs improvement to handle multiple blades.
-    # Allow Server-1 server-2 blade-3 node-4 or just plain 1 to all work.
-    if which[-1].isdigit():
+    # Allow Server-1 server-2 blade-3 node-4 or just plain 1.
+    if which[0].isalpha() and which[-1].isdigit():
             which = which[-1]
-    if which not in ['1','2','3','4']:
+    if not set(which).issubset(set('01234')):
         raise ValueError()
-    blade = ''.join(sorted(list('0' + which)))
+    blade = ''.join(sorted(set('0' + which)))
     return blade
 
 
 def main():
+    global specData
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGQUIT, handler)
 
     parser = argparse.ArgumentParser(description='Power-Up-Down VRTX; Check Health; Get IP addresses.')
     parser.add_argument('--cmc', help='Hostname or IP of VRTX chassis.', required=True)
     parser.add_argument('--user', help='VRTX chassis User Name.', required=True)
-    parser.add_argument('--powerUp', help='Turn on chassis and blades: 1,2,3,4,all.')
-    parser.add_argument('--powerDown', help='Turn off all blades, then chassis.', action='store_true')
+    parser.add_argument('--powerup', help='Turn on chassis and blades: 1,2,3,4,all.')
+    parser.add_argument('--powerdown', help='Turn off all blades, then chassis.', action='store_true')
     parser.add_argument('--health', help='Check temps of chassis and blades, check fans, report whats up.', action='store_true')
+    parser.add_argument('--inventory', help='Get lots of inventory and status info, write to JSON file.', action='store_true')
 
     parser.add_argument('--ip', help='Get IP address of a blade: 1,2,3,4,all.')
-    parser.add_argument('--logIn', help='logIn: 1,2,3,4,all.')
-    parser.add_argument('--logOut', help='logOut: 1,2,3,4,all.')
+    parser.add_argument('--login', help='logIn: 1,2,3,4,all.')
+    parser.add_argument('--logout', help='logOut: 1,2,3,4,all.')
     parser.add_argument('--ping', help='ping: 1,2,3,4,all.')
     parser.add_argument('--shutdown', help='Shutdown Linux machines: 1,2,3,4,all')
 
-    parser.add_argument('--configLinux', help='Configure Linux on blade: 1,2,3,4,all.')
+    parser.add_argument('--configlinux', help='Configure Linux on blade: 1,2,3,4,all.')
     parser.add_argument('--sshd', help='Configure Linux server for SSH root login: 1,2,3,4,all.')
-    parser.add_argument('--waitBlade', help='Wait for blade to boot: 1,2,3,4,all.')
+    parser.add_argument('--waitblade', help='Wait for blade to boot: 1,2,3,4,all.')
     #parser.add_argument('-v', '--verbose', help='See.', action='store_true')
     args = parser.parse_args()
 
     start_time = time.time()
 
+    specData['IP'] = args.cmc
     cmc = Cmc(args.cmc, args.user, os.environ[VRTX_PW])
 
     try:
-        if args.powerUp:
-            serversUp(cmc, argForm(args.powerUp))
+        if args.powerup:
+            serversUp(cmc, argForm(args.powerup))
 
-        if args.powerDown:
+        if args.powerdown:
             serversDown(cmc)
 
         if args.health:
-            health(cmc)
+            print(health(cmc))
 
-        if args.logIn:
-            login(cmc, argForm(args.logIn), os.environ[BLADE_ROOTPW])
+        if args.inventory:
+            inventory(cmc, os.environ[BLADE_ROOTPW])
+
+        if args.login:
+            login(cmc, argForm(args.login), os.environ[BLADE_ROOTPW])
 
         if args.shutdown:
             shutdown(cmc, argForm(args.shutdown), os.environ[BLADE_ROOTPW])
 
-        if args.logOut:
-            logout(cmc, argForm(args.logOut))
+        if args.logout:
+            logout(cmc, argForm(args.logout))
 
-        if args.configLinux:
-            configLinux(cmc, argForm(args.configLinux), os.environ[BLADE_ROOTPW])
+        if args.configlinux:
+            configLinux(cmc, argForm(args.configlinux), os.environ[BLADE_ROOTPW])
 
         if args.ip:
             print(getIPs(cmc, argForm(args.ip), os.environ[BLADE_ROOTPW]))
 
-        if args.waitBlade:
-            waitBlade(cmc, argForm(args.waitBlade), 1)
+        if args.waitblade:
+            waitBlade(cmc, argForm(args.waitblade), 1)
 
         if args.ping:
             ping(cmc, argForm(args.ping), os.environ[BLADE_ROOTPW])
